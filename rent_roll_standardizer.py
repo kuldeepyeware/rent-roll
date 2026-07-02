@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 MONEY_QUANTUM = Decimal("0.01")
@@ -49,12 +49,15 @@ CANONICAL_FIELDS = {
     "move_in_date",
     "lease_start_date",
     "lease_end_date",
+    "lease_date_range",
     "move_out_date",
     "balance",
     "deposit",
     "charge_code",
     "charge_description",
     "charge_amount",
+    "credit_amount",
+    "reported_unit_total",
     "property_name",
     "rent_roll_date",
     "ignore",
@@ -100,6 +103,9 @@ FIELD_ALIASES = {
         "lease end", "lease end date", "lease expiration", "lease expiry",
         "expiration", "expiry", "end date", "lease to",
     ],
+    "lease_date_range": [
+        "lease dates", "lease date range", "lease term", "lease period",
+    ],
     "move_out_date": [
         "move out", "move out date", "move-out", "move-out date", "mo date",
     ],
@@ -118,6 +124,13 @@ FIELD_ALIASES = {
     "charge_amount": [
         "charge amount", "amount", "monthly charge", "charge value",
     ],
+    "credit_amount": [
+        "credit amount", "credit", "monthly credit", "credit value",
+    ],
+    "reported_unit_total": [
+        "total billing", "monthly billing", "scheduled charges",
+        "total charges", "net change in balance",
+    ],
     "property_name": ["property", "property name", "community"],
     "rent_roll_date": ["rent roll date", "as of", "as of date", "report date"],
 }
@@ -129,6 +142,9 @@ CHARGE_ALIASES = {
     "CONCESSION": [
         "concession", "concessions", "conc", "discount", "rent credit",
         "lease incentive", "free rent", "empdisc",
+    ],
+    "LOSS_TO_LEASE": [
+        "loss to lease", "loss to old lease", "ltor", "ltol",
     ],
     "UTILITY": [
         "utility", "utilities", "water", "sewer", "gas", "electric", "electricity",
@@ -142,7 +158,8 @@ CHARGE_ALIASES = {
     "ADMIN_FEE": ["admin", "admin fee", "administrative fee", "billing fee"],
     "OTHER_RENT": [
         "amenity", "amenity fee", "premium", "unit premium", "washer dryer",
-        "w d", "cable", "internet", "technology",
+        "w d", "cable", "internet", "technology", "parcel locker",
+        "real estate tax allocation",
     ],
     "ONE_TIME_FEE": [
         "application fee", "late fee", "nsf", "damage", "cleaning fee",
@@ -896,6 +913,15 @@ def group_units(
     for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         if not any(not is_blank(value) for value in row):
             continue
+        if is_summary_section_row(row):
+            skipped.append(
+                {
+                    "row_number": row_index,
+                    "reason": "summary_or_secondary_section",
+                    "preview": row_preview(row),
+                }
+            )
+            break
         if is_report_footer_row(row, indexes):
             skipped.append(
                 {
@@ -922,6 +948,15 @@ def group_units(
                 {
                     "row_number": row_index,
                     "reason": "property_or_section_label",
+                    "preview": row_preview(row),
+                }
+            )
+            continue
+        if not is_blank(raw_unit) and normalized_unit is None:
+            skipped.append(
+                {
+                    "row_number": row_index,
+                    "reason": "non_unit_label_in_unit_column",
                     "preview": row_preview(row),
                 }
             )
@@ -984,6 +1019,21 @@ def group_units(
             {"row_number": row_index, "values": row}
         )
 
+    future_references = detect_future_unit_rows(rows, header_index)
+    for unit_number, row_numbers in future_references.items():
+        if unit_number in groups:
+            groups[unit_number]["future_source_rows"] = unique_preserving_order(
+                [*groups[unit_number]["future_source_rows"], *row_numbers]
+            )
+        else:
+            skipped.append(
+                {
+                    "reason": "future_unit_not_in_primary_roll",
+                    "associated_unit": unit_number,
+                    "source_rows": row_numbers,
+                }
+            )
+
     compact_groups = []
     for unit_number in order:
         group = groups[unit_number]
@@ -1016,7 +1066,11 @@ def classify_charges(
     code_index = indexes.get("charge_code")
     description_index = indexes.get("charge_description")
     amount_index = indexes.get("charge_amount")
-    if amount_index is None or (code_index is None and description_index is None):
+    credit_index = indexes.get("credit_amount")
+    if (
+        amount_index is None
+        and credit_index is None
+    ) or (code_index is None and description_index is None):
         return {}, []
 
     labels: list[str] = []
@@ -1028,10 +1082,16 @@ def classify_charges(
             if label and label not in labels:
                 labels.append(label)
             if label and len(label_samples[label]) < 3:
+                debit = money_decimal(cell(row, amount_index))
+                credit = money_decimal(cell(row, credit_index))
                 label_samples[label].append(
                     {
                         "unit": group["unit_number"],
-                        "amount": display_value(cell(row, amount_index)),
+                        "debit_amount": money_string(debit),
+                        "credit_amount": money_string(credit),
+                        "net_amount": money_string(
+                            (debit or Decimal("0")) - (credit or Decimal("0"))
+                        ),
                     }
                 )
 
@@ -1052,7 +1112,8 @@ def classify_charges(
                 '{"classifications":[{"source_text":"rnt","category":"BASE_RENT",'
                 '"confidence":0.9,"reason":"..."}]}. Allowed categories are BASE_RENT, '
                 "CONCESSION, UTILITY, PARKING, PET_FEE, PEST_FEE, TRASH_FEE, "
-                "STORAGE, ADMIN_FEE, OTHER_RENT, ONE_TIME_FEE, DEPOSIT, UNKNOWN. "
+                "STORAGE, ADMIN_FEE, OTHER_RENT, LOSS_TO_LEASE, ONE_TIME_FEE, "
+                "DEPOSIT, UNKNOWN. "
                 "Do not calculate amounts."
             ),
             {
@@ -1114,6 +1175,18 @@ def normalize_units(
         source_rows = [source["row_number"] for source in group["source_rows"]]
 
         raw_tenant_name = first_value(rows, indexes.get("tenant_name"))
+        raw_lease_start = first_value(rows, indexes.get("lease_start_date"))
+        raw_lease_end = first_value(rows, indexes.get("lease_end_date"))
+        raw_lease_range = first_value(rows, indexes.get("lease_date_range"))
+        lease_range_dates = extract_date_values(
+            raw_lease_range if raw_lease_range is not None else raw_lease_start
+        )
+        normalized_lease_start = date_value(raw_lease_start)
+        normalized_lease_end = date_value(raw_lease_end)
+        if normalized_lease_start is None and lease_range_dates:
+            normalized_lease_start = lease_range_dates[0]
+        if normalized_lease_end is None and len(lease_range_dates) >= 2:
+            normalized_lease_end = lease_range_dates[1]
         unit: dict[str, Any] = {
             "unit_number": group["unit_number"],
             "unit_type": first_value(rows, indexes.get("unit_type")),
@@ -1127,8 +1200,8 @@ def normalize_units(
             "effective_rent": None,
             "total_rent": None,
             "move_in_date": date_value(first_value(rows, indexes.get("move_in_date"))),
-            "lease_start_date": date_value(first_value(rows, indexes.get("lease_start_date"))),
-            "lease_end_date": date_value(first_value(rows, indexes.get("lease_end_date"))),
+            "lease_start_date": normalized_lease_start,
+            "lease_end_date": normalized_lease_end,
             "move_out_date": date_value(first_value(rows, indexes.get("move_out_date"))),
             "balance": money_value(first_value(rows, indexes.get("balance"))),
             "deposit": money_value(first_value(rows, indexes.get("deposit"))),
@@ -1162,27 +1235,36 @@ def normalize_units(
             )
 
         charge_amount_index = indexes.get("charge_amount")
+        credit_amount_index = indexes.get("credit_amount")
         charge_code_index = indexes.get("charge_code")
         charge_description_index = indexes.get("charge_description")
         for source in group["source_rows"]:
             row = source["values"]
-            amount = money_decimal(cell(row, charge_amount_index))
             label = charge_label(row, charge_code_index, charge_description_index)
-            if amount is None or not label:
+            debit_amount = money_decimal(cell(row, charge_amount_index))
+            credit_amount = money_decimal(cell(row, credit_amount_index))
+            if not label or (debit_amount is None and credit_amount is None):
                 continue
             decision = charge_decisions.get(
                 label,
                 ChargeDecision(label, "UNKNOWN", 0.2, "unresolved", "No classification"),
             )
-            unit["charges"].append(
-                {
-                    "source_text": label,
-                    "category": decision.category,
-                    "amount": money_string(amount),
-                    "source_row": source["row_number"],
-                    "confidence": decision.confidence,
-                }
-            )
+            signed_amounts: list[tuple[str, Decimal]] = []
+            if debit_amount is not None:
+                signed_amounts.append(("debit", debit_amount))
+            if credit_amount is not None:
+                signed_amounts.append(("credit", -abs(credit_amount)))
+            for direction, signed_amount in signed_amounts:
+                unit["charges"].append(
+                    {
+                        "source_text": label,
+                        "category": decision.category,
+                        "amount": money_string(signed_amount),
+                        "direction": direction,
+                        "source_row": source["row_number"],
+                        "confidence": decision.confidence,
+                    }
+                )
             if decision.category == "UNKNOWN":
                 flags.append(
                     flag(
@@ -2122,7 +2204,7 @@ def standardize_unit_id(value: Any) -> Optional[str]:
     text = str(value).strip()
     text = re.sub(r"\s*[-–—/]\s*", "-", text)
     text = re.sub(r"\s+", " ", text)
-    if is_summary_unit_text(text):
+    if is_summary_unit_text(text) or not is_plausible_unit_id(text):
         return None
     return text.upper()
 
@@ -2155,6 +2237,25 @@ def date_value(value: Any) -> Optional[str]:
         except ValueError:
             continue
     return None
+
+
+def extract_date_values(value: Any) -> list[str]:
+    if is_blank(value):
+        return []
+    if isinstance(value, (date, datetime, int, float)):
+        parsed = date_value(value)
+        return [parsed] if parsed else []
+    text = display_value(value)
+    candidates = re.findall(
+        r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b",
+        text,
+    )
+    parsed_dates = [
+        parsed
+        for candidate in candidates
+        if (parsed := date_value(candidate)) is not None
+    ]
+    return unique_preserving_order(parsed_dates)
 
 
 def valid_iso_date(value: str) -> bool:
@@ -2267,6 +2368,91 @@ def is_summary_unit_text(value: Any) -> bool:
     )
 
 
+def is_plausible_unit_id(value: Any) -> bool:
+    if is_blank(value) or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float, Decimal)):
+        return True
+    text = display_value(value).strip()
+    normalized = normalize_text(text)
+    reserved_labels = {
+        "charge code", "description", "scheduled", "status summary",
+        "unit count", "unit type", "future resident details",
+    }
+    if not normalized or normalized in reserved_labels or is_summary_unit_text(text):
+        return False
+    if re.search(r"\d", text):
+        return len(text) <= 36 and len(text.split()) <= 4
+    if normalized in ADMIN_TENANT_MARKERS:
+        return True
+    return not re.search(r"\s", text) and len(text) <= 12
+
+
+def is_summary_section_row(row: list[Any]) -> bool:
+    normalized_cells = [
+        normalize_text(value) for value in row if not is_blank(value)
+    ]
+    if not normalized_cells:
+        return False
+    joined = " ".join(normalized_cells)
+    markers = (
+        "status summary",
+        "charge code summary",
+        "average charges by unit type",
+        "average charges by unit type summary",
+        "summary of charges",
+        "summary groups",
+        "future resident details",
+        "future residents applicants",
+    )
+    if any(marker in joined for marker in markers):
+        return True
+    return (
+        "description" in normalized_cells
+        and "unit count" in normalized_cells
+        and any("scheduled" in value for value in normalized_cells)
+    )
+
+
+def detect_future_unit_rows(
+    rows: list[list[Any]], header_index: int
+) -> dict[str, list[int]]:
+    references: dict[str, list[int]] = defaultdict(list)
+    in_future_section = False
+    future_unit_column: Optional[int] = None
+    for row_number, row in enumerate(rows[header_index + 1:], start=header_index + 2):
+        normalized_cells = [
+            normalize_text(value) for value in row if not is_blank(value)
+        ]
+        joined = " ".join(normalized_cells)
+        if (
+            "future resident details" in joined
+            or "future residents applicants" in joined
+        ):
+            in_future_section = True
+            future_unit_column = None
+            continue
+        if not in_future_section:
+            continue
+        if future_unit_column is None:
+            for column_index, value in enumerate(row):
+                normalized = normalize_text(value)
+                if normalized in {
+                    "unit", "unit no", "unit number", "bldg unit",
+                    "building unit", "apt", "apartment",
+                }:
+                    future_unit_column = column_index
+                    break
+            continue
+        raw_unit = cell(row, future_unit_column)
+        unit_number = standardize_unit_id(raw_unit)
+        if unit_number:
+            references[unit_number].append(row_number)
+        elif is_property_total_row(row, {"unit_number": future_unit_column}):
+            break
+    return references
+
+
 def is_report_footer_row(row: list[Any], indexes: dict[str, int]) -> bool:
     unit_value = cell(row, indexes.get("unit_number"))
     if is_summary_unit_text(unit_value):
@@ -2301,10 +2487,13 @@ def is_data_title_row(row: list[Any], indexes: dict[str, int]) -> bool:
 
 
 def is_property_total_row(row: list[Any], indexes: dict[str, int]) -> bool:
-    if not is_blank(cell(row, indexes.get("unit_number"))):
+    unit_value = cell(row, indexes.get("unit_number"))
+    if not is_blank(unit_value) and is_plausible_unit_id(unit_value):
         return False
     normalized_cells = [normalize_text(value) for value in row if not is_blank(value)]
-    has_total_label = any(value in {"total", "totals", "grand total"} for value in normalized_cells)
+    has_total_label = any(
+        re.search(r"\btotal(?:s)?\b", value) for value in normalized_cells
+    )
     numeric_cells = sum(
         money_decimal(value) is not None for value in row if not is_blank(value)
     )
