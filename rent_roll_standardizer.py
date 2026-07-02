@@ -164,6 +164,10 @@ VACANT_WORDS = {
     "vacant", "vac", "available", "ready", "down", "unoccupied",
 }
 ADMIN_WORDS = {"admin", "office", "model", "employee", "manager", "non revenue"}
+ADMIN_TENANT_MARKERS = {
+    "admin", "administrative", "employee", "manager", "model", "non revenue",
+    "office",
+}
 TOTAL_WORDS = {
     "total", "totals", "subtotal", "grand total", "property total",
     "report total", "summary",
@@ -892,6 +896,15 @@ def group_units(
     for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         if not any(not is_blank(value) for value in row):
             continue
+        if is_report_footer_row(row, indexes):
+            skipped.append(
+                {
+                    "row_number": row_index,
+                    "reason": "report_summary_footer",
+                    "preview": row_preview(row),
+                }
+            )
+            break
         if is_property_total_row(row, indexes):
             skipped.append(
                 {"row_number": row_index, "reason": "property_total_footer", "preview": row_preview(row)}
@@ -904,6 +917,15 @@ def group_units(
             or not is_blank(cell(row, indexes.get("charge_code")))
             or not is_blank(cell(row, indexes.get("charge_description")))
         )
+        if is_data_title_row(row, indexes):
+            skipped.append(
+                {
+                    "row_number": row_index,
+                    "reason": "property_or_section_label",
+                    "preview": row_preview(row),
+                }
+            )
+            continue
         if is_section_row(row) and not row_has_charge:
             section_text = normalize_text(" ".join(display_value(value) for value in row))
             active_section = (
@@ -1309,6 +1331,70 @@ def validate(
         "warning",
     )
 
+    declared_summary = detect_source_summary(rows)
+    computed_summary = {
+        "unit_count": len(units),
+        "occupied_count": sum(unit["status"] == "occupied" for unit in units),
+        "vacant_count": sum(unit["status"] == "vacant" for unit in units),
+        "admin_model_count": sum(unit["status"] == "admin_model" for unit in units),
+        "occupancy_rate": (
+            sum(unit["status"] == "occupied" for unit in units) / len(units)
+            if units else None
+        ),
+    }
+    summary_mismatches = []
+    for field_name in (
+        "unit_count", "occupied_count", "vacant_count", "admin_model_count"
+    ):
+        declared_value = declared_summary.get(field_name)
+        if declared_value is not None and declared_value != computed_summary[field_name]:
+            summary_mismatches.append(
+                {
+                    "field": field_name,
+                    "source": declared_value,
+                    "computed": computed_summary[field_name],
+                }
+            )
+    declared_rate = declared_summary.get("occupancy_rate")
+    computed_rate = computed_summary.get("occupancy_rate")
+    if (
+        declared_rate is not None
+        and computed_rate is not None
+        and abs(float(declared_rate) - float(computed_rate)) > 0.001
+    ):
+        summary_mismatches.append(
+            {
+                "field": "occupancy_rate",
+                "source": round(float(declared_rate), 4),
+                "computed": round(float(computed_rate), 4),
+            }
+        )
+    has_declared_summary = any(
+        declared_summary.get(field_name) is not None
+        for field_name in (
+            "unit_count", "occupied_count", "vacant_count",
+            "admin_model_count", "occupancy_rate",
+        )
+    )
+    add_check(
+        checks,
+        "source_summary_reconciliation",
+        not summary_mismatches,
+        (
+            "Source unit and occupancy summary matches computed rollup"
+            if has_declared_summary and not summary_mismatches
+            else "No source unit/occupancy summary was available"
+            if not has_declared_summary
+            else f"{len(summary_mismatches)} source summary values did not match"
+        ),
+        "warning" if summary_mismatches else "info",
+        {
+            "source": declared_summary,
+            "computed": computed_summary,
+            "mismatches": summary_mismatches,
+        },
+    )
+
     invalid_dates = []
     for unit in units:
         for field_name in (
@@ -1428,7 +1514,7 @@ def build_rollup(
     occupied = sum(unit["status"] == "occupied" for unit in units)
     vacant = sum(unit["status"] == "vacant" for unit in units)
     admin_model = sum(unit["status"] == "admin_model" for unit in units)
-    denomin = occupied + vacant
+    denominator = len(units)
     effective_values = [
         value
         for unit in units
@@ -1448,7 +1534,7 @@ def build_rollup(
         "unknown_status_count": len(units) - occupied - vacant - admin_model,
         "average_effective_rent": money_string(average),
         "property_occupancy_rate": (
-            round(occupied / denomin, 4) if denomin else None
+            round(occupied / denominator, 4) if denominator else None
         ),
         "rent_roll_date": rent_roll_date,
     }
@@ -1497,9 +1583,18 @@ def detect_property_name(
             if not is_blank(value):
                 return str(value).strip()
 
+    for row in rows[:header_index]:
+        for value in row:
+            if not isinstance(value, str):
+                continue
+            match = re.match(r"^\s*propert(?:y|ies)\s*[:=]\s*(.+?)\s*$", value, re.I)
+            if match:
+                return match.group(1).strip()
+
     generic = re.compile(
         r"^(?:rent\s*roll|rent\s*roll\s+detail|as\s+of|month\s+year|"
-        r"report\s+date|parameters?|page\s+\d+)",
+        r"report\s+date|exported\s+on|units?\s*:|include\s+non.revenue|"
+        r"parameters?|page\s+\d+)",
         re.I,
     )
     for row in rows[:header_index]:
@@ -1984,24 +2079,35 @@ def charge_label(
 def normalize_status(value: Any, tenant_name: Any) -> str:
     normalized = normalize_text(value)
     tenant_normalized = normalize_text(tenant_name)
-    if any(word in normalized or word in tenant_normalized for word in ADMIN_WORDS):
+    if any(word in normalized for word in ADMIN_WORDS):
         return "admin_model"
     if any(word in normalized for word in VACANT_WORDS):
         return "vacant"
     if any(word in normalized for word in OCCUPIED_WORDS):
         return "occupied"
-    if tenant_normalized in {"vacant", "vac", "available"}:
+    if is_vacancy_marker(tenant_name):
         return "vacant"
+    if tenant_normalized in ADMIN_TENANT_MARKERS:
+        return "admin_model"
     if tenant_normalized:
         return "occupied"
     return "unknown"
+
+
+def is_vacancy_marker(value: Any) -> bool:
+    normalized = normalize_text(value)
+    return bool(
+        normalized in VACANT_WORDS
+        or normalized in {"no tenant", "vacant unit", "vacant units"}
+        or normalized.startswith("vacant unit ")
+    )
 
 
 def normalize_tenant_name(value: Any) -> Optional[str]:
     if is_blank(value):
         return None
     text = str(value).strip()
-    if normalize_text(text) in VACANT_WORDS | {"n a", "none", "no tenant"}:
+    if is_vacancy_marker(text) or normalize_text(text) in {"n a", "none"}:
         return None
     return text
 
@@ -2016,7 +2122,7 @@ def standardize_unit_id(value: Any) -> Optional[str]:
     text = str(value).strip()
     text = re.sub(r"\s*[-–—/]\s*", "-", text)
     text = re.sub(r"\s+", " ", text)
-    if normalize_text(text) in TOTAL_WORDS:
+    if is_summary_unit_text(text):
         return None
     return text.upper()
 
@@ -2148,6 +2254,52 @@ def is_total_row(row: list[Any]) -> bool:
     )
 
 
+def is_summary_unit_text(value: Any) -> bool:
+    normalized = normalize_text(value)
+    if not normalized:
+        return False
+    return bool(
+        normalized in TOTAL_WORDS
+        or re.match(r"^total(?: |$)", normalized)
+        or re.match(r"^(?:total )?\d+ units?(?: |$)", normalized)
+        or re.match(r"^unit count(?: |$)", normalized)
+        or re.match(r"^total number of units(?: |$)", normalized)
+    )
+
+
+def is_report_footer_row(row: list[Any], indexes: dict[str, int]) -> bool:
+    unit_value = cell(row, indexes.get("unit_number"))
+    if is_summary_unit_text(unit_value):
+        return True
+    populated = [display_value(value).strip() for value in row if not is_blank(value)]
+    if not populated:
+        return False
+    first = normalize_text(populated[0])
+    return bool(
+        re.match(r"^total market rent(?: |$)", first)
+        or re.match(r"^total number of units(?: |$)", first)
+        or re.match(r"^unit count(?: |$)", first)
+    )
+
+
+def is_data_title_row(row: list[Any], indexes: dict[str, int]) -> bool:
+    unit_value = cell(row, indexes.get("unit_number"))
+    if is_blank(unit_value):
+        return False
+    populated = [value for value in row if not is_blank(value)]
+    if len(populated) != 1:
+        return False
+    text = display_value(unit_value).strip()
+    normalized = normalize_text(text)
+    return len(text) >= 20 and (
+        any(character.isspace() for character in text)
+        or any(
+            token in normalized
+            for token in ("apartments", "community", "properties", "property", "village")
+        )
+    )
+
+
 def is_property_total_row(row: list[Any], indexes: dict[str, int]) -> bool:
     if not is_blank(cell(row, indexes.get("unit_number"))):
         return False
@@ -2171,6 +2323,82 @@ def is_section_row(row: list[Any]) -> bool:
         )
         and ("resident" in text or "/" in display_value(next(v for v in row if not is_blank(v))))
     )
+
+
+def detect_source_summary(rows: list[list[Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "unit_count": None,
+        "occupied_count": None,
+        "vacant_count": None,
+        "admin_model_count": None,
+        "occupancy_rate": None,
+    }
+    for row in rows:
+        populated = [display_value(value).strip() for value in row if not is_blank(value)]
+        if not populated:
+            continue
+        for text in populated:
+            normalized = re.sub(r"\s+", " ", text.strip())
+            patterns = [
+                ("unit_count", r"(?i)^unit\s+count\s*[:=]\s*([\d,]+)"),
+                ("unit_count", r"(?i)^(?:total\s+)?([\d,]+)\s+units?\b"),
+                ("unit_count", r"(?i)^total\s+number\s+of\s+units.*?([\d,]+)\s*$"),
+                ("occupied_count", r"(?i)^occupied\s+units?\s*[:=]\s*([\d,]+)"),
+                ("vacant_count", r"(?i)^vacant\s+units?\s*[:=]\s*([\d,]+)"),
+                ("admin_model_count", r"(?i)^(?:offline|non[ -]?rev)\s+units?\s*[:=]\s*([\d,]+)"),
+            ]
+            for field_name, pattern in patterns:
+                match = re.search(pattern, normalized)
+                if match:
+                    summary[field_name] = int(match.group(1).replace(",", ""))
+                    break
+            rate_match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*%\s*occupied", normalized)
+            if rate_match:
+                summary["occupancy_rate"] = float(rate_match.group(1)) / 100
+
+        label = normalize_text(populated[0])
+        numeric_values = [
+            amount
+            for value in row[1:]
+            if (amount := money_decimal(value)) is not None
+        ]
+        positive_integer_values = sorted(
+            {
+                int(amount)
+                for amount in numeric_values
+                if amount > 0 and amount == amount.to_integral_value()
+            }
+        )
+        smallest_count = positive_integer_values[0] if positive_integer_values else None
+        if (
+            label.startswith("current notice vacant residents")
+            and smallest_count is not None
+        ):
+            summary["unit_count"] = smallest_count
+            rate_candidates = [
+                float(amount) / 100
+                for amount in numeric_values
+                if Decimal("0") < amount < Decimal("100")
+                and amount != amount.to_integral_value()
+            ]
+            if rate_candidates:
+                summary["occupancy_rate"] = rate_candidates[0]
+        elif label.startswith("occupied units") and smallest_count is not None:
+            summary["occupied_count"] = smallest_count
+        elif label.startswith("total vacant units") and smallest_count is not None:
+            summary["vacant_count"] = smallest_count
+        elif label.startswith("total non rev units") and smallest_count is not None:
+            summary["admin_model_count"] = smallest_count
+
+    if (
+        summary["occupied_count"] is None
+        and summary["unit_count"] is not None
+        and summary["occupancy_rate"] is not None
+    ):
+        summary["occupied_count"] = round(
+            summary["unit_count"] * summary["occupancy_rate"]
+        )
+    return summary
 
 
 def detect_source_total_amounts(

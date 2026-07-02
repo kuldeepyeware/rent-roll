@@ -307,6 +307,7 @@ The strongest demo outcome is:
 Review every failed check even when the overall unit count looks right.
 Especially important checks are:
 
+- `source_summary_reconciliation`
 - `duplicate_unit_numbers`
 - `unit_charge_total_reconciliation`
 - `source_total_reconciliation`
@@ -316,6 +317,11 @@ Especially important checks are:
 
 A warning is not necessarily a parser failure. It means a human decision or
 source-data investigation is required.
+
+`source_summary_reconciliation` compares the computed unit count, occupied
+count, vacant count, non-revenue count, and occupancy rate with any summary
+values detected in the source workbook. This is intended to catch plausible-
+looking output that accidentally includes a footer or misclassifies vacancies.
 
 ### 8. Review the standardized workbook
 
@@ -373,8 +379,8 @@ The AI-assisted test run produced:
 - 123 occupied units
 - 16 vacant units
 - 1 admin/model unit
-- 88.49% occupancy
-- 8 of 8 validations passed
+- 87.86% occupancy
+- 9 validation checks, including source-summary reconciliation
 - 2 OpenRouter calls: column mapping and charge classification
 
 This is the best file for demonstrating AI classification of opaque charge
@@ -388,8 +394,8 @@ The deterministic test run produced:
 - 234 occupied units
 - 21 vacant units
 - 1 admin/model unit
-- 91.76% occupancy
-- 8 of 8 validations passed
+- 91.41% occupancy
+- 9 validation checks, including source-summary reconciliation
 - 10 future-resident records preserved without overwriting current records
 
 This is the best file for demonstrating two-row headers, repeated unit blocks,
@@ -402,7 +408,7 @@ footer detection, and future-resident handling.
 3. Open `06_column_mapping.json`.
 4. Open `07_charge_classification.json` and show deterministic vs. AI methods.
 5. Open one concession unit in `08_validation_report.json`.
-6. Show that all eight validations pass.
+6. Show that the source summary and all other validations pass.
 7. Open `standardized_rent_roll.xlsx` beside the original workbook.
 8. Start on `Summary`, then spot-check units on `Standardized Rent Roll`.
 9. Use `final_output.json` only for deeper debugging.
@@ -411,6 +417,33 @@ The product message should be visible throughout:
 
 > AI helps understand the document, but deterministic software produces the
 > final financial output.
+
+## Deterministic row and occupancy rules
+
+The parser applies the following rules before a row can become a unit:
+
+- Property-name rows immediately below the headers are treated as labels, not
+  unit records.
+- Footer rows such as `203 Units`, `Total 203 Units`, `Unit Count: 200`,
+  `Total Number of Units ...`, and `Total Market Rent ...` stop unit grouping.
+- A source summary is parsed independently and compared with the computed
+  rollup during validation.
+- Tenant placeholders such as `Vacant Unit`, `Vacant`, and `No Tenant` produce
+  a blank tenant name and `vacant` status.
+- An explicit source status such as `Current`, `Occupied`, or `Vacant` takes
+  precedence over descriptive words inside a tenant name.
+- Exact placeholders such as `MODEL`, `ADMIN`, or `OFFICE` are treated as
+  admin/model units when no explicit occupied/vacant status is available.
+
+Property occupancy is calculated deterministically as:
+
+```text
+occupied units / total physical units
+```
+
+Admin/model and unknown-status units remain in the denominator but are not
+counted as occupied. For example, 220 occupied units in a 232-unit property
+produce 94.83% occupancy even when two additional units are models.
 
 ## Troubleshooting
 
