@@ -803,7 +803,10 @@ def ai_map_columns(
             "You map ambiguous rent-roll columns. Return JSON only as "
             '{"mappings":[{"index":0,"field":"tenant_name","confidence":0.82,'
             '"reason":"..."}]}. Use only allowed_fields. Use unknown when uncertain. '
-            "Do not calculate or transform values."
+            "Use lease_date_range when one cell contains both lease dates. "
+            "Use credit_amount only for credits, never charge_amount. Use "
+            "reported_unit_total for a source-provided per-unit billing or "
+            "scheduled-charge total. Do not calculate or transform values."
         ),
         payload,
     )
@@ -858,16 +861,20 @@ def detect_structure(
     if unit_index is not None:
         seen_unit = False
         for row in nonempty_data_rows:
+            if is_summary_section_row(row) or is_report_footer_row(row, field_to_index):
+                break
             if is_total_row(row):
                 total_rows += 1
                 continue
-            unit_value = cell(row, unit_index)
-            if not is_blank(unit_value):
+            unit_value = standardize_unit_id(cell(row, unit_index))
+            if unit_value:
                 explicit_unit_rows += 1
                 seen_unit = True
             elif seen_unit:
                 continuation_rows += 1
-    has_charge_triplet = "charge_amount" in field_to_index and (
+    has_charge_triplet = (
+        "charge_amount" in field_to_index or "credit_amount" in field_to_index
+    ) and (
         "charge_code" in field_to_index or "charge_description" in field_to_index
     )
     if unit_index is None:
@@ -940,6 +947,7 @@ def group_units(
         normalized_unit = standardize_unit_id(raw_unit)
         row_has_charge = (
             not is_blank(cell(row, indexes.get("charge_amount")))
+            or not is_blank(cell(row, indexes.get("credit_amount")))
             or not is_blank(cell(row, indexes.get("charge_code")))
             or not is_blank(cell(row, indexes.get("charge_description")))
         )
@@ -1279,9 +1287,13 @@ def normalize_units(
             first_value(rows, indexes.get("effective_rent"))
         )
         explicit_total = money_decimal(first_value(rows, indexes.get("total_rent")))
+        reported_column_total = money_decimal(
+            first_value(rows, indexes.get("reported_unit_total"))
+        )
         reported_charge_total = money_decimal(group.get("reported_charge_total"))
         if explicit_total is None:
             explicit_total = reported_charge_total
+        unit["source"]["reported_unit_total"] = money_string(reported_column_total)
         charges = unit["charges"]
         base_total = sum_money(
             money_decimal(charge["amount"])
@@ -1297,6 +1309,9 @@ def normalize_units(
             money_decimal(charge["amount"])
             for charge in charges
             if charge["category"] in RECURRING_CHARGE_CATEGORIES
+        )
+        net_charge_total = sum_money(
+            money_decimal(charge["amount"]) for charge in charges
         )
 
         effective: Optional[Decimal]
@@ -1316,7 +1331,10 @@ def normalize_units(
             effective = None
             effective_formula = "unavailable"
 
-        if recurring_total is not None:
+        if reported_column_total is not None:
+            total = reported_column_total
+            total_formula = "source reported_unit_total field"
+        elif recurring_total is not None:
             total = (recurring_total + (concession_total or Decimal("0"))).quantize(MONEY_QUANTUM)
             total_formula = "sum(recurring charges) + normalized sum(CONCESSION)"
         elif explicit_total is not None:
@@ -1373,6 +1391,8 @@ def normalize_units(
                 "base_rent_total": money_string(base_total),
                 "concession_total": money_string(concession_total),
                 "recurring_charge_total_before_concession": money_string(recurring_total),
+                "net_charge_total_all_categories": money_string(net_charge_total),
+                "source_reported_unit_total": money_string(reported_column_total),
                 "effective_rent": money_string(effective),
                 "effective_rent_formula": effective_formula,
                 "total_rent": money_string(total),
@@ -1518,8 +1538,15 @@ def validate(
 
     unit_total_mismatches = []
     for unit in units:
-        reported = money_decimal(unit.get("source", {}).get("reported_charge_total"))
-        computed = money_decimal(unit.get("total_rent"))
+        reported = money_decimal(unit.get("source", {}).get("reported_unit_total"))
+        if reported is None:
+            reported = money_decimal(unit.get("source", {}).get("reported_charge_total"))
+        computed = sum_money(
+            money_decimal(charge.get("amount"))
+            for charge in unit.get("charges", [])
+        )
+        if computed is None:
+            computed = money_decimal(unit.get("total_rent"))
         if reported is not None and computed is not None and abs(reported - computed) > Decimal("0.01"):
             unit_total_mismatches.append(
                 {
@@ -2378,6 +2405,7 @@ def is_plausible_unit_id(value: Any) -> bool:
     reserved_labels = {
         "charge code", "description", "scheduled", "status summary",
         "unit count", "unit type", "future resident details",
+        "occupied no notice", "notice rented", "notice unrented",
     }
     if not normalized or normalized in reserved_labels or is_summary_unit_text(text):
         return False
@@ -2385,7 +2413,7 @@ def is_plausible_unit_id(value: Any) -> bool:
         return len(text) <= 36 and len(text.split()) <= 4
     if normalized in ADMIN_TENANT_MARKERS:
         return True
-    return not re.search(r"\s", text) and len(text) <= 12
+    return len(text) <= 12 and len(text.split()) <= 2
 
 
 def is_summary_section_row(row: list[Any]) -> bool:
@@ -2420,6 +2448,7 @@ def detect_future_unit_rows(
     references: dict[str, list[int]] = defaultdict(list)
     in_future_section = False
     future_unit_column: Optional[int] = None
+    current_future_unit: Optional[str] = None
     for row_number, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         normalized_cells = [
             normalize_text(value) for value in row if not is_blank(value)
@@ -2447,9 +2476,12 @@ def detect_future_unit_rows(
         raw_unit = cell(row, future_unit_column)
         unit_number = standardize_unit_id(raw_unit)
         if unit_number:
+            current_future_unit = unit_number
             references[unit_number].append(row_number)
         elif is_property_total_row(row, {"unit_number": future_unit_column}):
             break
+        elif current_future_unit and normalized_cells:
+            references[current_future_unit].append(row_number)
     return references
 
 
@@ -2559,6 +2591,20 @@ def detect_source_summary(rows: list[list[Any]]) -> dict[str, Any]:
             }
         )
         smallest_count = positive_integer_values[0] if positive_integer_values else None
+        first_positive_integer = next(
+            (
+                int(amount)
+                for amount in numeric_values
+                if amount > 0 and amount == amount.to_integral_value()
+            ),
+            None,
+        )
+        percentage_values = [
+            float(amount) / 100
+            for amount in numeric_values
+            if Decimal("0") < amount < Decimal("100")
+            and amount != amount.to_integral_value()
+        ]
         if (
             label.startswith("current notice vacant residents")
             and smallest_count is not None
@@ -2572,12 +2618,18 @@ def detect_source_summary(rows: list[list[Any]]) -> dict[str, Any]:
             ]
             if rate_candidates:
                 summary["occupancy_rate"] = rate_candidates[0]
+        elif label.startswith("total rentable units") and first_positive_integer is not None:
+            summary["unit_count"] = first_positive_integer
+        elif label.startswith("total occupied units") and first_positive_integer is not None:
+            summary["occupied_count"] = first_positive_integer
+            if percentage_values:
+                summary["occupancy_rate"] = percentage_values[0]
         elif label.startswith("occupied units") and smallest_count is not None:
             summary["occupied_count"] = smallest_count
-        elif label.startswith("total vacant units") and smallest_count is not None:
-            summary["vacant_count"] = smallest_count
-        elif label.startswith("total non rev units") and smallest_count is not None:
-            summary["admin_model_count"] = smallest_count
+        elif label.startswith("total vacant units") and first_positive_integer is not None:
+            summary["vacant_count"] = first_positive_integer
+        elif label.startswith("total non rev units") and first_positive_integer is not None:
+            summary["admin_model_count"] = first_positive_integer
 
     if (
         summary["occupied_count"] is None

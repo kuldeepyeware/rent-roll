@@ -445,6 +445,73 @@ Admin/model and unknown-status units remain in the denominator but are not
 counted as occupied. For example, 220 occupied units in a 232-unit property
 produce 94.83% occupancy even when two additional units are models.
 
+## Adaptive layout handling (v0.2)
+
+The parser no longer assumes that every nonblank cell under the unit-number
+header is a unit. It first separates the workbook into logical regions and
+admits rows into the canonical unit list only when they contain a plausible
+unit identifier.
+
+### Primary rent-roll boundaries
+
+The primary unit region ends when the parser encounters structural evidence
+such as:
+
+- A property-level total with several numeric totals
+- A status, charge-code, unit-type, or other summary section
+- A repeated summary header such as Description / Unit Count / Scheduled
+- A future-resident or applicant section
+
+Text labels such as `STATUS SUMMARY`, `DESCRIPTION`, `OCCUPIED NO NOTICE`, and
+`NOTICE RENTED` therefore cannot become unit numbers merely because they appear
+in the same column as real unit IDs.
+
+Plausible unit IDs are compact identifiers containing digits, short
+single/two-token identifiers, or exact admin markers such as `MODEL`. Long
+headings and descriptive prose are rejected and preserved in debug artifacts.
+
+### Future residents
+
+Future-resident sections are scanned independently from the current rent roll.
+Their rows are attached to matching current units through
+`source.future_record_rows`; they never create extra physical units or replace
+the current tenant and current charges.
+
+### Combined lease dates
+
+Columns named `Lease Dates`, `Lease Term`, or `Lease Period` are represented by
+the canonical `lease_date_range` role. When a cell contains two dates, for
+example:
+
+```text
+05/01/2025
+04/30/2026
+```
+
+the first date becomes `lease_start_date` and the second becomes
+`lease_end_date`. The parser does not ask the model to split or calculate
+dates.
+
+### Debit, credit, and reported totals
+
+Charge semantics now distinguish:
+
+- `charge_amount`: a debit or scheduled charge
+- `credit_amount`: a credit, stored as a negative signed charge
+- `reported_unit_total`: a source-provided per-unit billing or scheduled total
+
+This prevents a credit amount from winning a duplicate column mapping and
+becoming total rent.
+
+Loss-to-lease rows such as `LTOR`, `LTOL`, and `Loss To Old Lease` are classified
+as `LOSS_TO_LEASE`. They remain visible in the canonical charge ledger but are
+not treated as recurring rent.
+
+If a source provides `reported_unit_total`, it is preserved as the unit's total
+rent source and reconciled against the signed debit/credit ledger. Otherwise,
+the existing deterministic recurring-charge calculation is used. A mismatch
+is surfaced in validation instead of being silently resolved by AI.
+
 ## Troubleshooting
 
 ### OpenRouter is skipped
