@@ -1,14 +1,15 @@
-# Rent Roll Standardizer v0
+# Rent Roll Standardizer v0.3
 
 A practical, explainable prototype for turning a `.csv`, `.xlsx`, or `.xls`
 rent roll into a standardized JSON representation.
 
 The architecture deliberately separates two jobs:
 
-- Deterministic software detects structure, groups units, calculates rents,
-  calculates rollups, and runs validations.
-- OpenRouter is used only for uncertain column meanings and charge-code
-  classification.
+- Deterministic software profiles the workbook, validates a parse plan, groups
+  units, calculates rents, calculates rollups, and runs validations.
+- OpenRouter may propose document regions, uncertain column meanings, and
+  charge-code classifications. It never performs arithmetic or directly
+  creates canonical units.
 
 The output is designed to be inspected, not taken on faith. Every run creates
 a log and numbered artifacts that show what the parser did at each stage.
@@ -162,9 +163,9 @@ python rent_roll_standardizer.py \
 | `01_input_summary.json` | File type, workbook dimensions, sheets, model configuration |
 | `02_sheet_detection.json` | Which sheet was selected and why |
 | `03_header_detection.json` | Raw header rows, combined headers, confidence, alternatives |
-| `04_structure_detection.json` | Flat rows vs. repeating unit blocks, start row, footer detection |
-| `05_unit_grouping.json` | Units found, source row numbers, skipped rows, future-record rows |
-| `06_column_mapping.json` | Every source column, canonical mapping, confidence, method |
+| `04_structure_detection.json` | Redacted document profile, validated parse plan, regions, boundaries, and row model |
+| `05_unit_grouping.json` | Units found, source rows, skipped rows, and accounting for every non-empty primary-region row |
+| `06_column_mapping.json` | Initial mappings and the column roles actually used after parse-plan validation |
 | `07_charge_classification.json` | Every charge code, category, confidence, samples, method |
 | `08_validation_report.json` | Validation results and deterministic per-unit calculations |
 | `final_output.json` | Final standardized rent roll and property rollups |
@@ -209,13 +210,27 @@ Check:
 - Metadata rows like property name and report date were not treated as headers.
 - Confidence is reasonably high.
 
-### 3. Confirm unit grouping
+### 3. Confirm the parse plan and unit grouping
 
-Open `05_unit_grouping.json`.
+Open `04_structure_detection.json` first.
+
+Check:
+
+- `parse_plan.primary_region` starts on the first current-unit row and ends
+  before property totals, summaries, or future-resident tables.
+- `parse_plan.regions` describes the other visible parts of the workbook.
+- `unit_column_index` points to the actual unit/building-unit column.
+- `method` shows whether the deterministic fallback or a validated OpenRouter
+  proposal was used.
+- Any `warnings` are understandable and acceptable.
+
+Then open `05_unit_grouping.json`.
 
 Check:
 
 - `unit_count` matches the source summary.
+- `row_accounting.unaccounted_rows` is empty.
+- The row-role counts make sense for the source format.
 - The first, middle, and last few unit IDs exist.
 - Repeated charge rows belong to the correct unit.
 - Per-unit `source_row_numbers` point to the expected workbook rows.
@@ -307,6 +322,8 @@ The strongest demo outcome is:
 Review every failed check even when the overall unit count looks right.
 Especially important checks are:
 
+- `parse_plan_integrity`
+- `primary_row_accounting`
 - `source_summary_reconciliation`
 - `duplicate_unit_numbers`
 - `unit_charge_total_reconciliation`
@@ -445,7 +462,55 @@ Admin/model and unknown-status units remain in the denominator but are not
 counted as occupied. For example, 220 occupied units in a 232-unit property
 produce 94.83% occupancy even when two additional units are models.
 
-## Adaptive layout handling (v0.2)
+## Parse-plan architecture (v0.3)
+
+v0.3 treats structure discovery as a separate, inspectable compilation step.
+The parser does not immediately interpret every row beneath the header as unit
+data.
+
+The pipeline is:
+
+```text
+Workbook
+  → deterministic document profile
+  → AI-proposed parse plan (when OpenRouter is available)
+  → deterministic plan validation
+  → deterministic grouping and calculations
+  → canonical JSON
+  → QA spreadsheet
+```
+
+The document profile scans the full selected sheet for header boundaries,
+unit-ID patterns, totals, summaries, secondary tables, repeated rows, charge
+evidence, and date shapes. Data-like text is redacted before the structural
+profile is sent to the model.
+
+The parse plan declares:
+
+- The inclusive row range containing current physical units
+- The unit-number column
+- Whether rows are flat, repeated, or continuation-based unit blocks
+- Column roles used during execution
+- Other regions such as metadata, summaries, charge summaries, and future
+  residents
+
+The model's proposal is advisory. Deterministic guards reject invalid row
+ranges and column indexes, prevent a primary region from crossing a known
+summary/footer boundary, and reject plans that lose a material portion of the
+deterministically observed unit candidates. If the model is unavailable or its
+plan fails validation, the deterministic plan is used.
+
+During grouping, each non-empty row inside the accepted primary region is
+assigned a role such as `unit_start`, `unit_continuation`, `control_total`,
+`excluded_label`, or `excluded_unresolved`. The
+`primary_row_accounting` validation fails when a row has no role. This makes
+silent row loss visible during QA.
+
+Only the accepted `primary_units` region may create canonical units. Summary
+tables and future-resident sections remain available as evidence and control
+data but cannot silently inflate the physical unit count.
+
+## Adaptive field handling (v0.2, retained in v0.3)
 
 The parser no longer assumes that every nonblank cell under the unit-number
 header is a unit. It first separates the workbook into logical regions and

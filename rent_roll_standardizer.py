@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 MONEY_QUANTUM = Decimal("0.01")
@@ -844,17 +844,416 @@ def ai_map_columns(
     return [by_index[index] for index in sorted(by_index)]
 
 
-def detect_structure(
+def structural_row_signature(
+    row: list[Any],
+    row_number: int,
+    unit_column_index: Optional[int],
+) -> dict[str, Any]:
+    semantic_terms = {
+        "average", "charge", "code", "count", "credit", "debit",
+        "description", "future", "header", "lease", "notice", "occupied",
+        "rent", "rentable", "resident", "scheduled", "status", "summary",
+        "total", "unit", "vacant",
+    }
+    cells = []
+    numeric_count = 0
+    date_count = 0
+    text_count = 0
+    for value in row:
+        if is_blank(value):
+            cells.append("")
+            continue
+        if isinstance(value, (date, datetime)):
+            cells.append("<date>")
+            date_count += 1
+            continue
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+            cells.append("<number>")
+            numeric_count += 1
+            continue
+        text = display_value(value).strip()
+        parsed_dates = extract_date_values(text)
+        if parsed_dates:
+            cells.append("<date-range>" if len(parsed_dates) > 1 else "<date>")
+            date_count += len(parsed_dates)
+            continue
+        if money_decimal(text) is not None and looks_numeric(text):
+            cells.append("<number>")
+            numeric_count += 1
+            continue
+        normalized = normalize_text(text)
+        tokens = set(normalized.split())
+        if tokens & semantic_terms:
+            cells.append(text[:80])
+        elif re.search(r"\d", text) and len(text) <= 36:
+            cells.append("<id-like>")
+        else:
+            cells.append("<text>")
+        text_count += 1
+    raw_unit = cell(row, unit_column_index)
+    return {
+        "row_number": row_number,
+        "nonempty_count": sum(not is_blank(value) for value in row),
+        "numeric_count": numeric_count,
+        "date_count": date_count,
+        "text_count": text_count,
+        "unit_id_candidate": is_plausible_unit_id(raw_unit),
+        "summary_anchor": is_summary_section_row(row),
+        "cells": cells,
+    }
+
+
+def profile_document(
     rows: list[list[Any]],
     header_index: int,
     mappings: list[MappingDecision],
 ) -> dict[str, Any]:
+    indexes = mapping_indexes(mappings)
+    unit_index = indexes.get("unit_number")
+    data_start_row = header_index + 2
+    hard_boundaries = []
+    interesting_row_numbers = set(range(1, min(len(rows), header_index + 6) + 1))
+    interesting_row_numbers.update(range(max(1, len(rows) - 100), len(rows) + 1))
+
+    for row_number, row in enumerate(rows[data_start_row - 1:], start=data_start_row):
+        reasons = []
+        if is_property_total_row(row, indexes):
+            reasons.append("property_total")
+        if is_report_footer_row(row, indexes):
+            reasons.append("report_footer")
+        if is_summary_section_row(row):
+            reasons.append("summary_or_secondary_section")
+        if reasons:
+            hard_boundaries.append({"row_number": row_number, "reasons": reasons})
+            interesting_row_numbers.update(
+                range(max(data_start_row, row_number - 2), min(len(rows), row_number + 3) + 1)
+            )
+
+    signatures = [
+        structural_row_signature(rows[row_number - 1], row_number, unit_index)
+        for row_number in sorted(interesting_row_numbers)
+        if 1 <= row_number <= len(rows)
+        and any(not is_blank(value) for value in rows[row_number - 1])
+    ][:180]
+    return {
+        "row_count": len(rows),
+        "column_count": max((len(row) for row in rows), default=0),
+        "header_end_row": header_index + 1,
+        "deterministic_data_start_row": data_start_row,
+        "mapped_unit_column_index": unit_index,
+        "column_roles": indexes,
+        "hard_boundaries": hard_boundaries,
+        "interesting_rows": signatures,
+        "privacy_note": (
+            "Data-like text is redacted. Only structural labels, types, and "
+            "ID-like markers are sent for layout planning."
+        ),
+    }
+
+
+def infer_row_model(
+    rows: list[list[Any]],
+    start_row: int,
+    end_row: int,
+    unit_column_index: Optional[int],
+    mappings: list[MappingDecision],
+) -> str:
+    if unit_column_index is None:
+        return "unresolved"
+    explicit = 0
+    continuation = 0
+    seen_unit = False
+    indexes = mapping_indexes(mappings)
+    for row in rows[start_row - 1:end_row]:
+        if standardize_unit_id(cell(row, unit_column_index)):
+            explicit += 1
+            seen_unit = True
+        elif seen_unit and (
+            not is_blank(cell(row, indexes.get("charge_amount")))
+            or not is_blank(cell(row, indexes.get("credit_amount")))
+            or not is_blank(cell(row, indexes.get("charge_code")))
+            or not is_blank(cell(row, indexes.get("charge_description")))
+        ):
+            continuation += 1
+    if continuation > max(2, explicit * 0.15):
+        return "repeating_unit_blocks"
+    return "flat_or_repeated_unit_rows"
+
+
+def deterministic_parse_plan(
+    sheet_name: str,
+    rows: list[list[Any]],
+    header_index: int,
+    mappings: list[MappingDecision],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    indexes = mapping_indexes(mappings)
+    start_row = header_index + 2
+    boundary_rows = [
+        item["row_number"]
+        for item in profile.get("hard_boundaries", [])
+        if item["row_number"] >= start_row
+    ]
+    first_boundary = min(boundary_rows) if boundary_rows else None
+    end_row = (first_boundary - 1) if first_boundary else len(rows)
+    row_model = infer_row_model(
+        rows, start_row, end_row, indexes.get("unit_number"), mappings
+    )
+
+    regions = [
+        {
+            "name": "metadata_and_headers",
+            "kind": "metadata",
+            "start_row": 1,
+            "end_row": header_index + 1,
+            "include_in_canonical": False,
+            "purpose": "property metadata and source table headers",
+        },
+        {
+            "name": "current_rent_roll",
+            "kind": "primary_units",
+            "start_row": start_row,
+            "end_row": end_row,
+            "include_in_canonical": True,
+            "purpose": "current physical units and their continuation charge rows",
+        },
+    ]
+    if first_boundary:
+        regions.append(
+            {
+                "name": "post_primary_sections",
+                "kind": "summary_or_secondary",
+                "start_row": first_boundary,
+                "end_row": len(rows),
+                "include_in_canonical": False,
+                "purpose": "control totals, summaries, and future-resident details",
+            }
+        )
+    return {
+        "schema_version": "rent_roll_parse_plan.v1",
+        "sheet_name": sheet_name,
+        "method": "deterministic",
+        "confidence": 0.88 if first_boundary else 0.72,
+        "header_end_row": header_index + 1,
+        "primary_region": {
+            "start_row": start_row,
+            "end_row": end_row,
+            "unit_column_index": indexes.get("unit_number"),
+            "row_model": row_model,
+            "continuation_policy": (
+                "attach rows without a unit ID only when charge evidence exists"
+            ),
+        },
+        "column_roles": indexes,
+        "regions": regions,
+        "hard_boundary_row": first_boundary,
+        "warnings": (
+            [] if first_boundary else ["No explicit primary-region footer was detected"]
+        ),
+        "evidence": {
+            "hard_boundaries": profile.get("hard_boundaries", []),
+            "mapped_unit_column": indexes.get("unit_number"),
+        },
+    }
+
+
+def ai_parse_plan(
+    deterministic_plan: dict[str, Any],
+    profile: dict[str, Any],
+    mappings: list[MappingDecision],
+    rows: list[list[Any]],
+    client: OpenRouterClient,
+) -> dict[str, Any]:
+    result = client.json_call(
+        "layout_planning",
+        (
+            "You create a constrained parse plan for a rent-roll workbook. "
+            "Return JSON only with primary_region {start_row,end_row,"
+            "unit_column_index,row_model,continuation_policy}, column_roles, "
+            "regions, confidence, and reasons. Region kinds must be metadata, "
+            "primary_units, summary, future_units, charge_summary, or ignored. "
+            "Only primary_units may set include_in_canonical=true. Do not "
+            "extract tenants, calculate money, group units, or invent rows. "
+            "Respect hard boundaries and use zero-based column indexes."
+        ),
+        {
+            "deterministic_plan": deterministic_plan,
+            "document_profile": profile,
+            "column_mapping": [asdict(decision) for decision in mappings],
+        },
+    )
+    if not isinstance(result, dict):
+        return deterministic_plan
+    return validate_ai_parse_plan(
+        result, deterministic_plan, profile, mappings, rows
+    )
+
+
+def validate_ai_parse_plan(
+    proposal: dict[str, Any],
+    fallback: dict[str, Any],
+    profile: dict[str, Any],
+    mappings: list[MappingDecision],
+    rows: list[list[Any]],
+) -> dict[str, Any]:
+    warnings = list(fallback.get("warnings", []))
+    primary = proposal.get("primary_region")
+    if not isinstance(primary, dict):
+        return {**fallback, "warnings": [*warnings, "AI plan omitted primary_region"]}
+    try:
+        start_row = int(primary["start_row"])
+        end_row = int(primary["end_row"])
+        unit_column = int(primary["unit_column_index"])
+    except (KeyError, TypeError, ValueError):
+        return {**fallback, "warnings": [*warnings, "AI plan used invalid row or column values"]}
+
+    header_end = int(fallback["header_end_row"])
+    max_columns = int(profile.get("column_count", 0))
+    if (
+        start_row <= header_end
+        or end_row < start_row
+        or end_row > len(rows)
+        or unit_column < 0
+        or unit_column >= max_columns
+    ):
+        return {**fallback, "warnings": [*warnings, "AI plan failed range validation"]}
+
+    hard_boundary = fallback.get("hard_boundary_row")
+    if hard_boundary and end_row >= int(hard_boundary):
+        end_row = int(hard_boundary) - 1
+        warnings.append("AI primary region was clamped to a deterministic hard boundary")
+
+    proposed_unit_count = sum(
+        bool(standardize_unit_id(cell(row, unit_column)))
+        for row in rows[start_row - 1:end_row]
+    )
+    fallback_primary = fallback["primary_region"]
+    fallback_unit_column = fallback_primary.get("unit_column_index")
+    fallback_unit_count = (
+        sum(
+            bool(standardize_unit_id(cell(row, int(fallback_unit_column))))
+            for row in rows[
+                int(fallback_primary["start_row"]) - 1:
+                int(fallback_primary["end_row"])
+            ]
+        )
+        if fallback_unit_column is not None else 0
+    )
+    minimum_expected = max(1, round(fallback_unit_count * 0.90))
+    if proposed_unit_count < minimum_expected:
+        return {
+            **fallback,
+            "warnings": [
+                *warnings,
+                "AI plan rejected because its primary region lost too many unit candidates",
+            ],
+        }
+
+    allowed_row_models = {
+        "flat_unit_rows", "flat_or_repeated_unit_rows",
+        "repeating_unit_blocks", "repeated_unit_rows",
+    }
+    row_model = str(primary.get("row_model", fallback_primary["row_model"]))
+    if row_model not in allowed_row_models:
+        row_model = fallback_primary["row_model"]
+        warnings.append("Unsupported AI row model was replaced by deterministic inference")
+
+    allowed_roles = CANONICAL_FIELDS - {"ignore", "unknown"}
+    proposed_roles = proposal.get("column_roles", {})
+    validated_roles = dict(fallback.get("column_roles", {}))
+    if isinstance(proposed_roles, dict):
+        for role, index in proposed_roles.items():
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                continue
+            if role in allowed_roles and 0 <= index < max_columns:
+                validated_roles[role] = index
+    validated_roles["unit_number"] = unit_column
+
+    regions = []
+    raw_regions = proposal.get("regions", [])
+    allowed_region_kinds = {
+        "metadata", "primary_units", "summary", "future_units",
+        "charge_summary", "ignored",
+    }
+    if isinstance(raw_regions, list):
+        for region in raw_regions:
+            if not isinstance(region, dict):
+                continue
+            try:
+                region_start = int(region["start_row"])
+                region_end = int(region["end_row"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            kind = str(region.get("kind", "ignored"))
+            if (
+                kind not in allowed_region_kinds
+                or region_start < 1
+                or region_end < region_start
+                or region_end > len(rows)
+            ):
+                continue
+            regions.append(
+                {
+                    "name": str(region.get("name", kind)),
+                    "kind": kind,
+                    "start_row": region_start,
+                    "end_row": region_end,
+                    "include_in_canonical": kind == "primary_units",
+                    "purpose": str(region.get("purpose", "")),
+                }
+            )
+    if not regions:
+        regions = fallback["regions"]
+
+    try:
+        confidence = min(max(float(proposal.get("confidence", 0.65)), 0), 0.90)
+    except (TypeError, ValueError):
+        confidence = 0.65
+    return {
+        **fallback,
+        "method": "openrouter_proposal+deterministic_validation",
+        "confidence": confidence,
+        "primary_region": {
+            "start_row": start_row,
+            "end_row": end_row,
+            "unit_column_index": unit_column,
+            "row_model": row_model,
+            "continuation_policy": str(
+                primary.get(
+                    "continuation_policy",
+                    fallback_primary["continuation_policy"],
+                )
+            ),
+        },
+        "column_roles": validated_roles,
+        "regions": regions,
+        "warnings": warnings,
+        "ai_reasons": proposal.get("reasons", []),
+        "evidence": {
+            **fallback.get("evidence", {}),
+            "proposed_unit_candidates": proposed_unit_count,
+            "fallback_unit_candidates": fallback_unit_count,
+        },
+    }
+
+
+def detect_structure(
+    rows: list[list[Any]],
+    header_index: int,
+    mappings: list[MappingDecision],
+    parse_plan: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     field_to_index = mapping_indexes(mappings)
-    data_rows = rows[header_index + 1:]
+    primary = (parse_plan or {}).get("primary_region", {})
+    start_row = int(primary.get("start_row", header_index + 2))
+    end_row = int(primary.get("end_row", len(rows)))
+    data_rows = rows[start_row - 1:end_row]
     nonempty_data_rows = [
         row for row in data_rows if any(not is_blank(value) for value in row)
     ]
-    unit_index = field_to_index.get("unit_number")
+    unit_index = primary.get("unit_column_index", field_to_index.get("unit_number"))
     explicit_unit_rows = 0
     continuation_rows = 0
     total_rows = 0
@@ -877,9 +1276,16 @@ def detect_structure(
     ) and (
         "charge_code" in field_to_index or "charge_description" in field_to_index
     )
+    planned_row_model = primary.get("row_model")
     if unit_index is None:
         pattern = "unresolved_unit_column"
         confidence = 0.15
+    elif planned_row_model in {
+        "flat_unit_rows", "flat_or_repeated_unit_rows",
+        "repeating_unit_blocks", "repeated_unit_rows",
+    }:
+        pattern = planned_row_model
+        confidence = float((parse_plan or {}).get("confidence", 0.75))
     elif continuation_rows > max(2, explicit_unit_rows * 0.15) and has_charge_triplet:
         pattern = "repeating_unit_blocks"
         confidence = 0.88
@@ -889,14 +1295,62 @@ def detect_structure(
     return {
         "pattern": pattern,
         "confidence": confidence,
-        "data_start_row": header_index + 2,
+        "data_start_row": start_row,
+        "data_end_row": end_row,
         "unit_column_index": unit_index,
         "explicit_unit_rows": explicit_unit_rows,
         "continuation_rows": continuation_rows,
         "total_or_footer_rows": total_rows,
         "charge_columns_detected": has_charge_triplet,
         "rows_considered": len(nonempty_data_rows),
+        "parse_plan_method": (parse_plan or {}).get("method", "legacy_inference"),
     }
+
+
+def apply_parse_plan_roles(
+    mappings: list[MappingDecision],
+    parse_plan: dict[str, Any],
+) -> list[MappingDecision]:
+    """Turn a validated plan's column roles into the mappings used by execution."""
+    raw_roles = parse_plan.get("column_roles", {})
+    if not isinstance(raw_roles, dict):
+        return mappings
+    role_by_index: dict[int, str] = {}
+    for role, raw_index in raw_roles.items():
+        if role not in CANONICAL_FIELDS - {"ignore", "unknown"}:
+            continue
+        try:
+            source_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if source_index not in role_by_index or role == "unit_number":
+            role_by_index[source_index] = role
+    plan_confidence = min(float(parse_plan.get("confidence", 0.70)), 0.90)
+    return [
+        MappingDecision(
+            source_index=decision.source_index,
+            source_header=decision.source_header,
+            canonical_field=role_by_index.get(
+                decision.source_index, decision.canonical_field
+            ),
+            confidence=(
+                plan_confidence
+                if decision.source_index in role_by_index
+                else decision.confidence
+            ),
+            method=(
+                "validated_parse_plan"
+                if decision.source_index in role_by_index
+                else decision.method
+            ),
+            reason=(
+                "Column role selected by the validated document parse plan"
+                if decision.source_index in role_by_index
+                else decision.reason
+            ),
+        )
+        for decision in mappings
+    ]
 
 
 def group_units(
@@ -904,12 +1358,23 @@ def group_units(
     header_index: int,
     mappings: list[MappingDecision],
     context: RunContext,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    parse_plan: Optional[dict[str, Any]] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     indexes = mapping_indexes(mappings)
-    unit_index = indexes.get("unit_number")
+    primary = (parse_plan or {}).get("primary_region", {})
+    start_row = int(primary.get("start_row", header_index + 2))
+    end_row = int(primary.get("end_row", len(rows)))
+    unit_index = primary.get("unit_column_index", indexes.get("unit_number"))
     if unit_index is None:
         context.warn("Could not confidently map a unit-number column; no units were grouped")
-        return [], []
+        return [], [], {
+            "primary_start_row": start_row,
+            "primary_end_row": end_row,
+            "nonempty_rows": 0,
+            "accounted_rows": 0,
+            "unaccounted_rows": [],
+            "row_role_counts": {},
+        }
 
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -917,10 +1382,18 @@ def group_units(
     current_unit: Optional[str] = None
     future_unit: Optional[str] = None
     active_section = "primary"
-    for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
+    row_roles: list[dict[str, Any]] = []
+
+    def account(row_number: int, role: str, reason: str) -> None:
+        row_roles.append(
+            {"row_number": row_number, "role": role, "reason": reason}
+        )
+
+    for row_index, row in enumerate(rows[start_row - 1:end_row], start=start_row):
         if not any(not is_blank(value) for value in row):
             continue
         if is_summary_section_row(row):
+            account(row_index, "excluded_control", "summary_or_secondary_section")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -930,6 +1403,7 @@ def group_units(
             )
             break
         if is_report_footer_row(row, indexes):
+            account(row_index, "excluded_control", "report_summary_footer")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -939,6 +1413,7 @@ def group_units(
             )
             break
         if is_property_total_row(row, indexes):
+            account(row_index, "excluded_control", "property_total_footer")
             skipped.append(
                 {"row_number": row_index, "reason": "property_total_footer", "preview": row_preview(row)}
             )
@@ -952,6 +1427,7 @@ def group_units(
             or not is_blank(cell(row, indexes.get("charge_description")))
         )
         if is_data_title_row(row, indexes):
+            account(row_index, "excluded_label", "property_or_section_label")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -961,6 +1437,7 @@ def group_units(
             )
             continue
         if not is_blank(raw_unit) and normalized_unit is None:
+            account(row_index, "excluded_label", "non_unit_label_in_unit_column")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -976,6 +1453,7 @@ def group_units(
                 if "future" in section_text or "applicant" in section_text
                 else "primary"
             )
+            account(row_index, "excluded_label", f"{active_section}_section_heading")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -989,6 +1467,7 @@ def group_units(
                 future_unit = normalized_unit
             if future_unit and future_unit in groups:
                 groups[future_unit]["future_source_rows"].append(row_index)
+            account(row_index, "secondary_record", "future_resident_record")
             skipped.append(
                 {
                     "row_number": row_index,
@@ -1003,6 +1482,7 @@ def group_units(
                 reported_total = money_decimal(cell(row, indexes.get("charge_amount")))
                 if reported_total is not None:
                     groups[current_unit]["reported_charge_total"] = reported_total
+            account(row_index, "control_total", "total_or_footer")
             skipped.append({"row_number": row_index, "reason": "total_or_footer", "preview": row_preview(row)})
             continue
         if normalized_unit:
@@ -1017,10 +1497,12 @@ def group_units(
                 }
                 order.append(current_unit)
             groups[current_unit]["raw_unit_values"].append(display_value(raw_unit))
+            account(row_index, "unit_start", "plausible normalized unit ID")
         elif current_unit and row_has_charge:
-            pass
+            account(row_index, "unit_continuation", "charge evidence attached to current unit")
         else:
             reason = "continuation_without_unit" if current_unit else "row_before_first_unit"
+            account(row_index, "excluded_unresolved", reason)
             skipped.append({"row_number": row_index, "reason": reason, "preview": row_preview(row)})
             continue
         groups[current_unit]["source_rows"].append(
@@ -1059,9 +1541,34 @@ def group_units(
                 ),
             }
         )
-    return [groups[unit_number] for unit_number in order], compact_groups + [
-        {"skipped_rows": skipped}
-    ]
+    primary_nonempty = {
+        row_number
+        for row_number, row in enumerate(rows[start_row - 1:end_row], start=start_row)
+        if any(not is_blank(value) for value in row)
+    }
+    accounted = {item["row_number"] for item in row_roles}
+    unaccounted = sorted(primary_nonempty - accounted)
+    row_role_counts = Counter(item["role"] for item in row_roles)
+    row_accounting = {
+        "primary_start_row": start_row,
+        "primary_end_row": end_row,
+        "nonempty_rows": len(primary_nonempty),
+        "accounted_rows": len(primary_nonempty & accounted),
+        "unaccounted_rows": [
+            {
+                "row_number": row_number,
+                "preview": row_preview(rows[row_number - 1]),
+            }
+            for row_number in unaccounted
+        ],
+        "row_role_counts": dict(sorted(row_role_counts.items())),
+        "row_roles": row_roles,
+    }
+    return (
+        [groups[unit_number] for unit_number in order],
+        compact_groups + [{"skipped_rows": skipped}],
+        row_accounting,
+    )
 
 
 def classify_charges(
@@ -1413,8 +1920,45 @@ def validate(
     rows: list[list[Any]],
     header_index: int,
     mappings: list[MappingDecision],
+    parse_plan: Optional[dict[str, Any]] = None,
+    row_accounting: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+
+    primary = (parse_plan or {}).get("primary_region", {})
+    plan_valid = bool(
+        primary
+        and primary.get("unit_column_index") is not None
+        and int(primary.get("start_row", 0)) > header_index + 1
+        and int(primary.get("end_row", 0)) >= int(primary.get("start_row", 0))
+    )
+    add_check(
+        checks,
+        "parse_plan_integrity",
+        plan_valid,
+        (
+            f"Validated primary region rows {primary.get('start_row')}-"
+            f"{primary.get('end_row')} using unit column "
+            f"{primary.get('unit_column_index')}"
+            if plan_valid
+            else "No executable primary-unit region was established"
+        ),
+        "error" if not plan_valid else "info",
+        {"method": (parse_plan or {}).get("method"), "warnings": (parse_plan or {}).get("warnings", [])},
+    )
+    unaccounted_rows = (row_accounting or {}).get("unaccounted_rows", [])
+    add_check(
+        checks,
+        "primary_row_accounting",
+        not unaccounted_rows,
+        (
+            "Every non-empty row in the primary region was assigned a parsing role"
+            if not unaccounted_rows
+            else f"{len(unaccounted_rows)} primary-region rows were not accounted for"
+        ),
+        "warning",
+        row_accounting or {},
+    )
 
     add_check(
         checks,
@@ -1984,9 +2528,37 @@ def run(args: argparse.Namespace) -> Path:
     )
 
     deterministic_mappings = deterministic_column_mapping(headers)
-    mappings = ai_map_columns(
+    initial_mappings = ai_map_columns(
         deterministic_mappings, selected.rows[header_index + 1:header_index + 9], client
     )
+    document_profile = profile_document(
+        selected.rows, header_index, initial_mappings
+    )
+    fallback_parse_plan = deterministic_parse_plan(
+        selected.name,
+        selected.rows,
+        header_index,
+        initial_mappings,
+        document_profile,
+    )
+    parse_plan = ai_parse_plan(
+        fallback_parse_plan,
+        document_profile,
+        initial_mappings,
+        selected.rows,
+        client,
+    )
+    mappings = apply_parse_plan_roles(initial_mappings, parse_plan)
+    primary_region = parse_plan["primary_region"]
+    context.logger.info(
+        "Parse plan selected primary unit region rows %d-%d using %s (confidence %.0f%%)",
+        primary_region["start_row"],
+        primary_region["end_row"],
+        parse_plan["method"],
+        parse_plan["confidence"] * 100,
+    )
+    for warning in parse_plan.get("warnings", []):
+        context.warn(f"Parse plan: {warning}")
     for decision in mappings:
         if decision.canonical_field == "unknown":
             context.warn(
@@ -2001,7 +2573,9 @@ def run(args: argparse.Namespace) -> Path:
                 decision.method,
             )
 
-    structure = detect_structure(selected.rows, header_index, mappings)
+    structure = detect_structure(
+        selected.rows, header_index, mappings, parse_plan
+    )
     context.logger.info(
         "Detected structural pattern %s (confidence %.0f%%)",
         structure["pattern"], structure["confidence"] * 100,
@@ -2010,17 +2584,22 @@ def run(args: argparse.Namespace) -> Path:
         "04_structure_detection.json",
         {
             **structure,
+            "document_profile": document_profile,
+            "parse_plan": parse_plan,
             "fallback_used": structure["confidence"] < 0.65,
             "uncertain_columns": [
                 decision.source_header
                 for decision in mappings
                 if decision.canonical_field == "unknown"
             ],
+            "openrouter_calls": [
+                call for call in client.calls if call["task"] == "layout_planning"
+            ],
         },
     )
 
-    groups, grouping_artifact = group_units(
-        selected.rows, header_index, mappings, context
+    groups, grouping_artifact, row_accounting = group_units(
+        selected.rows, header_index, mappings, context, parse_plan
     )
     context.logger.info("Grouped %d units", len(groups))
     context.artifact(
@@ -2028,6 +2607,9 @@ def run(args: argparse.Namespace) -> Path:
         {
             "unit_count": len(groups),
             "grouping_method": structure["pattern"],
+            "parse_plan_method": parse_plan["method"],
+            "primary_region": primary_region,
+            "row_accounting": row_accounting,
             "groups": grouping_artifact,
         },
     )
@@ -2035,6 +2617,7 @@ def run(args: argparse.Namespace) -> Path:
         "06_column_mapping.json",
         {
             "canonical_fields": sorted(CANONICAL_FIELDS),
+            "initial_decisions": [asdict(decision) for decision in initial_mappings],
             "decisions": [asdict(decision) for decision in mappings],
             "openrouter_calls": [
                 call for call in client.calls if call["task"] == "column_mapping"
@@ -2064,7 +2647,14 @@ def run(args: argparse.Namespace) -> Path:
         groups, mappings, charge_decisions, context
     )
     context.logger.info("Calculated totals for %d units using deterministic rules", len(units))
-    validation = validate(units, selected.rows, header_index, mappings)
+    validation = validate(
+        units,
+        selected.rows,
+        header_index,
+        mappings,
+        parse_plan,
+        row_accounting,
+    )
     validation["summary"]["warning_count"] = sum(
         not check["passed"] and check.get("severity") == "warning"
         for check in validation["checks"]
@@ -2099,7 +2689,15 @@ def run(args: argparse.Namespace) -> Path:
         "processing": {
             "parser_version": VERSION,
             "deterministic_structure": True,
-            "ai_scope": ["column_mapping", "charge_classification"],
+            "parse_plan": parse_plan,
+            "row_accounting": {
+                key: value
+                for key, value in row_accounting.items()
+                if key != "row_roles"
+            },
+            "ai_scope": [
+                "column_mapping", "layout_planning", "charge_classification"
+            ],
             "openrouter_model": context.model if client.available else None,
             "openrouter_calls": client.calls,
             "warnings": context.warnings,
