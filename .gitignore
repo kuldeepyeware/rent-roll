@@ -1,0 +1,11 @@
+.env
+.venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+
+test_files/
+output/
+test_output/
+real_test_output/
+final_demo_runs/
