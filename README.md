@@ -166,7 +166,7 @@ python rent_roll_standardizer.py \
 | `04_structure_detection.json` | Redacted document profile, validated parse plan, regions, boundaries, and row model |
 | `05_unit_grouping.json` | Units found, source rows, skipped rows, and accounting for every non-empty primary-region row |
 | `06_column_mapping.json` | Initial mappings and the column roles actually used after parse-plan validation |
-| `07_charge_classification.json` | Every charge code, category, confidence, samples, method |
+| `07_charge_classification.json` | Charge categories plus the file-level financial profile and validated treatment plan |
 | `08_validation_report.json` | Validation results and deterministic per-unit calculations |
 | `final_output.json` | Final standardized rent roll and property rollups |
 | `standardized_rent_roll.xlsx` | Primary QA workbook with one row per unit and a Summary sheet |
@@ -493,6 +493,32 @@ The parse plan declares:
 - Column roles used during execution
 - Other regions such as metadata, summaries, charge summaries, and future
   residents
+
+After grouping, v0.3 builds a second, file-level `financial_plan`. This keeps
+charge category and financial treatment separate. Identifying a row as a
+`CONCESSION` does not by itself establish whether it is a recurring monthly
+adjustment, a one-time move-in credit, or a current-period full-month
+concession.
+
+The financial profile compares each charge label across the property, including
+its frequency, sample amounts, and size relative to base rent. OpenRouter may
+propose the financial behavior, but deterministic guards validate the
+proposal. A credit that offsets nearly a full month of base rent cannot be
+treated as recurring without affirmative recurring evidence.
+
+The recurring-rent contract is:
+
+```text
+effective rent = recurring base rent + concessions established as recurring
+total rent     = recurring base and ancillary charges
+                 + concessions established as recurring
+```
+
+One-time concessions remain visible in the canonical charge ledger and source
+reconciliations but do not erase contractual recurring rent. If periodicity
+cannot be established, the charge is excluded from recurring rent and the unit
+receives an `UNRESOLVED_CONCESSION_PERIODICITY` warning rather than a silent
+guess.
 
 The model's proposal is advisory. Deterministic guards reject invalid row
 ranges and column indexes, prevent a primary region from crossing a known

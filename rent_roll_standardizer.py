@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 MONEY_QUANTUM = Decimal("0.01")
@@ -171,6 +171,14 @@ CHARGE_ALIASES = {
 RECURRING_CHARGE_CATEGORIES = {
     "BASE_RENT", "UTILITY", "PARKING", "PET_FEE", "PEST_FEE", "TRASH_FEE",
     "STORAGE", "ADMIN_FEE", "OTHER_RENT",
+}
+
+RECURRING_CONCESSION_TERMS = {
+    "monthly", "recurring", "ongoing", "employee discount", "employee concession",
+}
+ONE_TIME_CONCESSION_TERMS = {
+    "one time", "one-time", "move in", "move-in", "free month",
+    "first month", "lease incentive", "upfront",
 }
 
 OCCUPIED_WORDS = {
@@ -1675,11 +1683,222 @@ def classify_charges(
     return decisions, artifact
 
 
+def build_financial_profile(
+    groups: list[dict[str, Any]],
+    mappings: list[MappingDecision],
+    charge_decisions: dict[str, ChargeDecision],
+) -> dict[str, Any]:
+    """Summarize charge behavior across the file without delegating arithmetic."""
+    indexes = mapping_indexes(mappings)
+    amount_index = indexes.get("charge_amount")
+    credit_index = indexes.get("credit_amount")
+    code_index = indexes.get("charge_code")
+    description_index = indexes.get("charge_description")
+    observations: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for group in groups:
+        row_charges: list[tuple[str, Decimal]] = []
+        for source in group["source_rows"]:
+            row = source["values"]
+            label = charge_label(row, code_index, description_index)
+            debit = money_decimal(cell(row, amount_index))
+            credit = money_decimal(cell(row, credit_index))
+            if not label:
+                continue
+            if debit is not None:
+                row_charges.append((label, debit))
+            if credit is not None:
+                row_charges.append((label, -abs(credit)))
+        base_total = sum_money(
+            amount
+            for label, amount in row_charges
+            if charge_decisions.get(label)
+            and charge_decisions[label].category == "BASE_RENT"
+        )
+        for label, amount in row_charges:
+            decision = charge_decisions.get(label)
+            if decision is None:
+                continue
+            ratio = (
+                abs(amount / base_total)
+                if base_total is not None and base_total != 0
+                else None
+            )
+            observations[label].append(
+                {
+                    "amount": money_string(amount),
+                    "absolute_base_rent_ratio": (
+                        round(float(ratio), 4) if ratio is not None else None
+                    ),
+                }
+            )
+
+    labels = []
+    for label, items in observations.items():
+        ratios = sorted(
+            item["absolute_base_rent_ratio"]
+            for item in items
+            if item["absolute_base_rent_ratio"] is not None
+        )
+        median_ratio = ratios[len(ratios) // 2] if ratios else None
+        labels.append(
+            {
+                "source_text": label,
+                "category": charge_decisions[label].category,
+                "occurrence_count": len(items),
+                "median_absolute_base_rent_ratio": median_ratio,
+                "minimum_absolute_base_rent_ratio": ratios[0] if ratios else None,
+                "maximum_absolute_base_rent_ratio": ratios[-1] if ratios else None,
+                "sample_amounts": [item["amount"] for item in items[:5]],
+            }
+        )
+    return {
+        "metric_contract": {
+            "effective_rent": (
+                "contractual recurring base rent plus only concessions established "
+                "as recurring; otherwise preserve and flag the credit"
+            ),
+            "total_rent": (
+                "recurring base and ancillary charges plus only concessions "
+                "established as recurring"
+            ),
+            "source_period_total": (
+                "a control value for reconciliation, not automatically recurring rent"
+            ),
+        },
+        "charge_patterns": labels,
+    }
+
+
+def deterministic_financial_plan(
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    treatments: dict[str, dict[str, Any]] = {}
+    for pattern in profile.get("charge_patterns", []):
+        label = str(pattern["source_text"])
+        category = str(pattern["category"])
+        representative_amount = money_decimal(
+            next(iter(pattern.get("sample_amounts", [])), None)
+        )
+        median_ratio = pattern.get("median_absolute_base_rent_ratio")
+        representative_base = (
+            abs(representative_amount) / Decimal(str(median_ratio))
+            if representative_amount is not None and median_ratio not in (None, 0)
+            else None
+        )
+        treatment, confidence, reason = financial_treatment(
+            category, label, representative_amount, representative_base
+        )
+        treatments[label] = {
+            "category": category,
+            "treatment": treatment,
+            "confidence": confidence,
+            "method": "deterministic",
+            "reason": reason,
+        }
+    return {
+        "schema_version": "rent_roll_financial_plan.v1",
+        "method": "deterministic",
+        "metric_contract": profile["metric_contract"],
+        "charge_treatments": treatments,
+        "warnings": [],
+    }
+
+
+def ai_financial_plan(
+    profile: dict[str, Any],
+    fallback: dict[str, Any],
+    client: OpenRouterClient,
+) -> dict[str, Any]:
+    if not any(
+        pattern.get("category") == "CONCESSION"
+        for pattern in profile.get("charge_patterns", [])
+    ):
+        return fallback
+    result = client.json_call(
+        "financial_semantics_planning",
+        (
+            "Interpret financial behavior in a rent-roll report. Return JSON only "
+            'as {"charge_treatments":[{"source_text":"con","treatment":'
+            '"one_time_concession","confidence":0.9,"reason":"..."}],'
+            '"file_interpretation":"..."}. Allowed concession treatments are '
+            "recurring_concession, one_time_concession, and "
+            "unresolved_concession. A current-period credit is not recurring "
+            "merely because it appears beside monthly rent. A credit near one "
+            "full month of base rent is normally a one-time/full-month concession "
+            "unless the source explicitly says it recurs. Do not calculate rent, "
+            "change categories, identify tenants, or invent source facts."
+        ),
+        profile,
+    )
+    if not isinstance(result, dict) or not isinstance(
+        result.get("charge_treatments"), list
+    ):
+        return fallback
+
+    plan = {
+        **fallback,
+        "method": "openrouter_proposal+deterministic_validation",
+        "file_interpretation": str(result.get("file_interpretation", "")),
+        "charge_treatments": {
+            label: dict(item)
+            for label, item in fallback["charge_treatments"].items()
+        },
+    }
+    patterns = {
+        item["source_text"]: item for item in profile.get("charge_patterns", [])
+    }
+    allowed = {
+        "recurring_concession", "one_time_concession", "unresolved_concession"
+    }
+    for proposed in result["charge_treatments"]:
+        if not isinstance(proposed, dict):
+            continue
+        label = str(proposed.get("source_text", ""))
+        pattern = patterns.get(label)
+        if not pattern or pattern.get("category") != "CONCESSION":
+            continue
+        treatment = str(proposed.get("treatment", ""))
+        if treatment not in allowed:
+            continue
+        try:
+            confidence = min(max(float(proposed.get("confidence", 0.5)), 0), 0.90)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        normalized_label = normalize_text(label)
+        explicit_recurring = any(
+            term in normalized_label for term in RECURRING_CONCESSION_TERMS
+        )
+        median_ratio = pattern.get("median_absolute_base_rent_ratio")
+        if (
+            treatment == "recurring_concession"
+            and median_ratio is not None
+            and float(median_ratio) >= 0.90
+            and not explicit_recurring
+        ):
+            plan["warnings"].append(
+                f"Rejected recurring treatment for {label!r}: it offsets "
+                "at least 90% of monthly base rent without recurring evidence"
+            )
+            continue
+        if confidence < 0.60:
+            treatment = "unresolved_concession"
+        plan["charge_treatments"][label] = {
+            "category": "CONCESSION",
+            "treatment": treatment,
+            "confidence": round(confidence, 2),
+            "method": "openrouter_proposal+deterministic_validation",
+            "reason": str(proposed.get("reason", "AI file-level interpretation")),
+        }
+    return plan
+
+
 def normalize_units(
     groups: list[dict[str, Any]],
     mappings: list[MappingDecision],
     charge_decisions: dict[str, ChargeDecision],
     context: RunContext,
+    financial_plan: Optional[dict[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     indexes = mapping_indexes(mappings)
     units = []
@@ -1807,15 +2026,72 @@ def normalize_units(
             for charge in charges
             if charge["category"] == "BASE_RENT"
         )
+        treatment_plan = (financial_plan or {}).get("charge_treatments", {})
+        for charge in charges:
+            planned = treatment_plan.get(charge["source_text"], {})
+            if planned:
+                treatment = str(planned.get("treatment", "excluded_unknown"))
+                treatment_confidence = float(planned.get("confidence", 0.30))
+                treatment_reason = str(planned.get("reason", "Financial plan"))
+            else:
+                treatment, treatment_confidence, treatment_reason = financial_treatment(
+                    charge["category"],
+                    charge["source_text"],
+                    money_decimal(charge["amount"]),
+                    base_total,
+                )
+            charge["rent_treatment"] = treatment
+            charge["rent_treatment_confidence"] = round(treatment_confidence, 2)
+            charge["rent_treatment_reason"] = treatment_reason
+
         concession_total = sum_money(
             normalized_concession(money_decimal(charge["amount"]))
             for charge in charges
             if charge["category"] == "CONCESSION"
         )
+        recurring_concession_total = sum_money(
+            normalized_concession(money_decimal(charge["amount"]))
+            for charge in charges
+            if charge.get("rent_treatment") == "recurring_concession"
+        )
+        excluded_concession_total = sum_money(
+            normalized_concession(money_decimal(charge["amount"]))
+            for charge in charges
+            if charge["category"] == "CONCESSION"
+            and charge.get("rent_treatment") != "recurring_concession"
+        )
+        unresolved_concessions = [
+            charge for charge in charges
+            if charge.get("rent_treatment") == "unresolved_concession"
+        ]
+        one_time_concessions = [
+            charge for charge in charges
+            if charge.get("rent_treatment") == "one_time_concession"
+        ]
+        if unresolved_concessions:
+            flags.append(
+                flag(
+                    "UNRESOLVED_CONCESSION_PERIODICITY",
+                    "A concession was preserved but excluded from recurring rent "
+                    "because its periodicity is not established",
+                    "warning",
+                )
+            )
+        if one_time_concessions:
+            flags.append(
+                flag(
+                    "ONE_TIME_CONCESSION_EXCLUDED",
+                    "A one-time/current-period concession was excluded from "
+                    "recurring effective and total rent",
+                    "info",
+                )
+            )
         recurring_total = sum_money(
             money_decimal(charge["amount"])
             for charge in charges
-            if charge["category"] in RECURRING_CHARGE_CATEGORIES
+            if charge.get("rent_treatment") in {
+                "recurring_base_rent", "recurring_charge"
+            }
         )
         net_charge_total = sum_money(
             money_decimal(charge["amount"]) for charge in charges
@@ -1825,12 +2101,16 @@ def normalize_units(
         total: Optional[Decimal]
         effective_formula: str
         total_formula: str
-        if base_total is not None:
-            effective = (base_total + (concession_total or Decimal("0"))).quantize(MONEY_QUANTUM)
-            effective_formula = "sum(BASE_RENT) + normalized sum(CONCESSION)"
-        elif explicit_effective is not None:
+        if explicit_effective is not None:
             effective = explicit_effective
             effective_formula = "source effective_rent field"
+        elif base_total is not None:
+            effective = (
+                base_total + (recurring_concession_total or Decimal("0"))
+            ).quantize(MONEY_QUANTUM)
+            effective_formula = (
+                "sum(BASE_RENT) + concessions validated as recurring"
+            )
         elif explicit_total is not None:
             effective = explicit_total
             effective_formula = "fallback to source total_rent field"
@@ -1842,8 +2122,12 @@ def normalize_units(
             total = reported_column_total
             total_formula = "source reported_unit_total field"
         elif recurring_total is not None:
-            total = (recurring_total + (concession_total or Decimal("0"))).quantize(MONEY_QUANTUM)
-            total_formula = "sum(recurring charges) + normalized sum(CONCESSION)"
+            total = (
+                recurring_total + (recurring_concession_total or Decimal("0"))
+            ).quantize(MONEY_QUANTUM)
+            total_formula = (
+                "sum(recurring charges) + concessions validated as recurring"
+            )
         elif explicit_total is not None:
             total = explicit_total
             total_formula = "source total_rent field"
@@ -1897,6 +2181,12 @@ def normalize_units(
                 "source_rows": source_rows,
                 "base_rent_total": money_string(base_total),
                 "concession_total": money_string(concession_total),
+                "recurring_concession_total": money_string(
+                    recurring_concession_total
+                ),
+                "excluded_concession_total": money_string(
+                    excluded_concession_total
+                ),
                 "recurring_charge_total_before_concession": money_string(recurring_total),
                 "net_charge_total_all_categories": money_string(net_charge_total),
                 "source_reported_unit_total": money_string(reported_column_total),
@@ -2056,6 +2346,30 @@ def validate(
         "All normalized dates are valid" if not invalid_dates else f"{len(invalid_dates)} invalid dates",
         "warning",
         invalid_dates,
+    )
+
+    unresolved_concession_treatments = [
+        {
+            "unit": unit["unit_number"],
+            "source_text": charge["source_text"],
+            "amount": charge["amount"],
+        }
+        for unit in units
+        for charge in unit.get("charges", [])
+        if charge.get("rent_treatment") == "unresolved_concession"
+    ]
+    add_check(
+        checks,
+        "concession_periodicity_resolved",
+        not unresolved_concession_treatments,
+        (
+            "All concessions have an established recurring or one-time treatment"
+            if not unresolved_concession_treatments
+            else f"{len(unresolved_concession_treatments)} concessions have "
+            "unresolved periodicity and were excluded from recurring rent"
+        ),
+        "warning",
+        unresolved_concession_treatments,
     )
 
     rent_anomalies = []
@@ -2632,19 +2946,37 @@ def run(args: argparse.Namespace) -> Path:
         "Categorized %d distinct charge label%s",
         len(charge_decisions), "" if len(charge_decisions) == 1 else "s",
     )
+    financial_profile = build_financial_profile(
+        groups, mappings, charge_decisions
+    )
+    fallback_financial_plan = deterministic_financial_plan(financial_profile)
+    financial_plan = ai_financial_plan(
+        financial_profile, fallback_financial_plan, client
+    )
+    context.logger.info(
+        "Financial semantics plan established using %s",
+        financial_plan["method"],
+    )
+    for warning in financial_plan.get("warnings", []):
+        context.warn(f"Financial plan: {warning}")
     context.artifact(
         "07_charge_classification.json",
         {
             "taxonomy": sorted(set(CHARGE_ALIASES) | {"UNKNOWN"}),
             "decisions": charge_artifact,
+            "financial_profile": financial_profile,
+            "financial_plan": financial_plan,
             "openrouter_calls": [
-                call for call in client.calls if call["task"] == "charge_classification"
+                call for call in client.calls
+                if call["task"] in {
+                    "charge_classification", "financial_semantics_planning"
+                }
             ],
         },
     )
 
     units, calculations = normalize_units(
-        groups, mappings, charge_decisions, context
+        groups, mappings, charge_decisions, context, financial_plan
     )
     context.logger.info("Calculated totals for %d units using deterministic rules", len(units))
     validation = validate(
@@ -2690,13 +3022,15 @@ def run(args: argparse.Namespace) -> Path:
             "parser_version": VERSION,
             "deterministic_structure": True,
             "parse_plan": parse_plan,
+            "financial_plan": financial_plan,
             "row_accounting": {
                 key: value
                 for key, value in row_accounting.items()
                 if key != "row_roles"
             },
             "ai_scope": [
-                "column_mapping", "layout_planning", "charge_classification"
+                "column_mapping", "layout_planning", "charge_classification",
+                "financial_semantics_planning",
             ],
             "openrouter_model": context.model if client.available else None,
             "openrouter_calls": client.calls,
@@ -2929,6 +3263,56 @@ def normalized_concession(value: Optional[Decimal]) -> Optional[Decimal]:
     if value is None:
         return None
     return -abs(value)
+
+
+def financial_treatment(
+    category: str,
+    source_text: str,
+    amount: Optional[Decimal],
+    base_rent_total: Optional[Decimal],
+) -> tuple[str, float, str]:
+    """Classify how a charge participates in recurring rent calculations."""
+    if category == "BASE_RENT":
+        return "recurring_base_rent", 1.0, "Base rent is recurring rent"
+    if category in RECURRING_CHARGE_CATEGORIES:
+        return "recurring_charge", 0.95, "Category is part of recurring charges"
+    if category == "CONCESSION":
+        normalized = normalize_text(source_text)
+        if any(term in normalized for term in RECURRING_CONCESSION_TERMS):
+            return (
+                "recurring_concession",
+                0.90,
+                "Source text explicitly describes a recurring concession",
+            )
+        if any(term in normalized for term in ONE_TIME_CONCESSION_TERMS):
+            return (
+                "one_time_concession",
+                0.90,
+                "Source text explicitly describes a one-time concession",
+            )
+        if (
+            amount is not None
+            and base_rent_total is not None
+            and base_rent_total > 0
+            and abs(amount) >= abs(base_rent_total) * Decimal("0.90")
+        ):
+            return (
+                "one_time_concession",
+                0.88,
+                "Credit offsets at least 90% of one month of base rent",
+            )
+        return (
+            "unresolved_concession",
+            0.40,
+            "The source does not establish whether this concession recurs",
+        )
+    if category == "ONE_TIME_FEE":
+        return "one_time_charge", 0.95, "Category is explicitly one-time"
+    if category == "DEPOSIT":
+        return "deposit", 1.0, "Deposits are not rent"
+    if category == "LOSS_TO_LEASE":
+        return "informational", 0.95, "Loss-to-lease is an analytical amount, not a charge"
+    return "excluded_unknown", 0.30, "No recurring-rent treatment is established"
 
 
 def sum_money(values: Iterable[Optional[Decimal]]) -> Optional[Decimal]:
