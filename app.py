@@ -19,15 +19,6 @@ st.markdown("""
 Upload a Rent Roll spreadsheet (`.xlsx`, `.xls`, `.csv`) and get a standardized JSON and Excel file.
 """)
 
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("OpenRouter API Key", type="password", help="Get this from openrouter.ai")
-    model_id = st.text_input("Model ID", value="anthropic/claude-haiku-4.5")
-    
-    st.markdown("---")
-    st.markdown("This tool uses AI to standardize complex rent roll spreadsheets. A valid OpenRouter API key is recommended for optimal parsing.")
-
 # Main content area
 uploaded_file = st.file_uploader("Upload Rent Roll", type=['csv', 'xlsx', 'xls'])
 
@@ -49,9 +40,12 @@ if st.button("Standardize", type="primary"):
                 
                 # Set up environment variables for the subprocess
                 env = os.environ.copy()
-                if api_key:
-                    env["OPENROUTER_API_KEY"] = api_key
-                env["OPENROUTER_MODEL"] = model_id
+                
+                # Automatically pull from st.secrets if running on Streamlit Community Cloud
+                if "OPENROUTER_API_KEY" in st.secrets:
+                    env["OPENROUTER_API_KEY"] = st.secrets["OPENROUTER_API_KEY"]
+                if "OPENROUTER_MODEL" in st.secrets:
+                    env["OPENROUTER_MODEL"] = st.secrets["OPENROUTER_MODEL"]
                 
                 # Run the standardizer script as a subprocess
                 script_path = Path(__file__).parent / "rent_roll_standardizer.py"
