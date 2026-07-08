@@ -50,10 +50,11 @@ if st.button("Standardize", type="primary"):
                 # Run the standardizer script as a subprocess
                 script_path = Path(__file__).parent / "rent_roll_standardizer.py"
                 
+                import sys
                 try:
                     result = subprocess.run(
                         [
-                            "python3", 
+                            sys.executable, 
                             str(script_path), 
                             "--input", str(input_file_path),
                             "--output-dir", str(output_dir_path)
